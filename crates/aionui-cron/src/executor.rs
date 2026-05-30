@@ -834,18 +834,30 @@ impl JobExecutor {
             return Ok(());
         }
 
-        agent
-            .set_mode(desired_mode)
-            .await
-            .map_err(|e| CronError::Scheduler(format!("set session mode to {desired_mode}: {e}")))?;
-
-        info!(
-            conversation_id = %agent.conversation_id(),
-            from_mode = %current_mode.mode,
-            to_mode = desired_mode,
-            initialized = current_mode.initialized,
-            "Applied cron session mode before execution"
-        );
+        match agent.set_mode(desired_mode).await {
+            Ok(()) => {
+                info!(
+                    conversation_id = %agent.conversation_id(),
+                    from_mode = %current_mode.mode,
+                    to_mode = desired_mode,
+                    initialized = current_mode.initialized,
+                    "Applied cron session mode before execution"
+                );
+            }
+            Err(e) if e.to_string().contains("not supported") => {
+                warn!(
+                    conversation_id = %agent.conversation_id(),
+                    desired_mode,
+                    error = %e,
+                    "Agent type does not support session mode switching, skipping"
+                );
+            }
+            Err(e) => {
+                return Err(CronError::Scheduler(format!(
+                    "set session mode to {desired_mode}: {e}"
+                )));
+            }
+        }
 
         Ok(())
     }
@@ -1006,6 +1018,13 @@ async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[Str
             if config.is_preset.unwrap_or(false) {
                 extra.insert(
                     "preset_assistant_id".to_owned(),
+                    serde_json::Value::String(custom_agent_id.clone()),
+                );
+            }
+            // Remote agent factory expects `remote_agent_id` in the extra.
+            if config.backend == "remote" {
+                extra.insert(
+                    "remote_agent_id".to_owned(),
                     serde_json::Value::String(custom_agent_id.clone()),
                 );
             }
