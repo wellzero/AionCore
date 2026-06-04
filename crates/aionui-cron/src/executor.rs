@@ -7,6 +7,7 @@ use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentRegistry, AgentStreamEvent};
 use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
 use aionui_common::{AgentType, ProviderWithModel, now_ms};
+use chrono::Local;
 use aionui_conversation::ConversationService;
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationRowUpdate, IConversationRepository};
@@ -99,12 +100,6 @@ impl JobExecutor {
     }
 
     pub async fn execute(&self, job: &CronJob) -> ExecutionResult {
-        let conversation_id = &job.conversation_id;
-
-        if self.busy_guard.is_busy(conversation_id) {
-            return self.handle_busy(job);
-        }
-
         let saved_skill = match self.prepare_saved_skill(job).await {
             Ok(skill) => skill,
             Err(e) => {
@@ -120,6 +115,10 @@ impl JobExecutor {
                 return ExecutionResult::Error { message: e.to_string() };
             }
         };
+
+        if self.busy_guard.is_busy(&target_conversation_id) {
+            return self.handle_busy(job);
+        }
 
         self.busy_guard.set_processing(&target_conversation_id, true);
 
@@ -409,9 +408,15 @@ impl JobExecutor {
 
         let extra = build_conversation_extra(&self.agent_registry, job, saved_skill).await;
 
+        let name = job
+            .conversation_title
+            .as_ref()
+            .map(|t| format!("{} · {}", t, Local::now().format("%b %-d")))
+            .unwrap_or_else(|| format!("{} · {}", job.name, Local::now().format("%b %-d")));
+
         let req = CreateConversationRequest {
             r#type: agent_type,
-            name: Some(job.name.clone()),
+            name: Some(name),
             model,
             source: None,
             channel_chat_id: None,
@@ -514,7 +519,25 @@ impl JobExecutor {
                 return ExecutionResult::Error { message: e.to_string() };
             }
         };
-        let build_extra = build_task_extra(&self.agent_registry, job, &skill_names).await;
+
+        // For NewConversation mode the agent must be built with ALL skills that
+        // were stored on the conversation row during creation (auto-inject +
+        // saved).  resolve_task_skill_names only returns the saved skill for
+        // NewConversation, which would cause auto-inject skills to be missing
+        // from the agent because WorkerTaskManagerImpl caches by conversation_id
+        // and the first build wins.
+        let agent_build_skills = if matches!(job.execution_mode, ExecutionMode::NewConversation) {
+            let from_row = self.load_conversation_skill_names(conversation_id).await.unwrap_or_default();
+            if from_row.is_empty() {
+                skill_names.clone()
+            } else {
+                from_row
+            }
+        } else {
+            skill_names.clone()
+        };
+
+        let build_extra = build_task_extra(&self.agent_registry, job, &agent_build_skills).await;
         let requested_workspace_missing = workspace.trim().is_empty();
 
         let options = BuildTaskOptions {
