@@ -23,7 +23,13 @@ pub async fn run_server(env: ServerEnvironment, services: AppServices) -> Result
     let router = create_router(&services).await;
     let addr = env.config.socket_addr();
     let listener = TcpListener::bind(&addr).await?;
-    info!(elapsed_ms = boot.elapsed().as_millis(), "Server listening on {addr}");
+    let bound_addr = listener.local_addr()?;
+    info!(
+        elapsed_ms = boot.elapsed().as_millis(),
+        "Server listening on {bound_addr}"
+    );
+    // Emit machine-readable port for the web-host launcher (M4+).
+    println!("AIONCORE_LISTENING {{\"port\":{}}}", bound_addr.port());
 
     // Kick off the idle-ACP-agent reaper. `start_idle_scanner` returns
     // immediately with a `JoinHandle`; the scanner task polls every 60 s

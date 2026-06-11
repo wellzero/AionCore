@@ -7,11 +7,11 @@ use aionui_ai_agent::types::{BuildTaskOptions, SendMessageData};
 use aionui_ai_agent::{AgentRegistry, AgentStreamEvent};
 use aionui_api_types::{CreateConversationRequest, SendMessageRequest};
 use aionui_common::{AgentType, ProviderWithModel, now_ms};
-use chrono::Local;
 use aionui_conversation::ConversationService;
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationRowUpdate, IConversationRepository};
 use aionui_realtime::EventBroadcaster;
+use chrono::Local;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
@@ -411,6 +411,7 @@ impl JobExecutor {
         let name = job
             .conversation_title
             .as_ref()
+            .filter(|t| !t.trim().is_empty())
             .map(|t| format!("{} · {}", t, Local::now().format("%b %-d")))
             .unwrap_or_else(|| format!("{} · {}", job.name, Local::now().format("%b %-d")));
 
@@ -527,7 +528,10 @@ impl JobExecutor {
         // from the agent because WorkerTaskManagerImpl caches by conversation_id
         // and the first build wins.
         let agent_build_skills = if matches!(job.execution_mode, ExecutionMode::NewConversation) {
-            let from_row = self.load_conversation_skill_names(conversation_id).await.unwrap_or_default();
+            let from_row = self
+                .load_conversation_skill_names(conversation_id)
+                .await
+                .unwrap_or_default();
             if from_row.is_empty() {
                 skill_names.clone()
             } else {
@@ -876,9 +880,7 @@ impl JobExecutor {
                 );
             }
             Err(e) => {
-                return Err(CronError::Scheduler(format!(
-                    "set session mode to {desired_mode}: {e}"
-                )));
+                return Err(CronError::Scheduler(format!("set session mode to {desired_mode}: {e}")));
             }
         }
 
