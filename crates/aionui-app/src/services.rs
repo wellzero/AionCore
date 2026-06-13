@@ -13,8 +13,9 @@ use aionui_common::OnConversationDelete;
 use aionui_conversation::runtime_state::ConversationRuntimeStateService;
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
-    IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteConversationRepository,
-    SqliteMcpServerRepository, SqliteProviderRepository, SqliteUserRepository,
+    IRemoteAgentRepository, IUserRepository, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteConversationRepository, SqliteMcpServerRepository, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
 use aionui_team::GuideMcpServer;
@@ -127,6 +128,8 @@ impl AppServices {
 
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+        let remote_agent_repo: Arc<dyn IRemoteAgentRepository> =
+            Arc::new(SqliteRemoteAgentRepository::new(database.pool().clone()));
 
         // Skill paths need app resource dir (for builtin rules) + data dir
         // (for user skills + materialized views). AcpSkillManager uses these
@@ -178,6 +181,7 @@ impl AppServices {
             backend_binary_path: backend_binary_path.clone(),
             guide_mcp_config: guide_mcp_config.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            remote_agent_repo,
         });
 
         // Agent factory is now wired. Future extension/custom agents

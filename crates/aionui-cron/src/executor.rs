@@ -13,6 +13,7 @@ use aionui_conversation::{ConversationError, ConversationService};
 use aionui_db::models::MessageRow;
 use aionui_db::{ConversationRowUpdate, IConversationRepository};
 use aionui_realtime::EventBroadcaster;
+use chrono::Local;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 use tracing::{error, info, warn};
@@ -431,9 +432,16 @@ impl JobExecutor {
 
         let extra = build_conversation_extra(&self.agent_registry, job, saved_skill).await;
 
+        let name = job
+            .conversation_title
+            .as_ref()
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| format!("{} · {}", t, Local::now().format("%b %-d")))
+            .unwrap_or_else(|| format!("{} · {}", job.name, Local::now().format("%b %-d")));
+
         let req = CreateConversationRequest {
             r#type: agent_type,
-            name: Some(job.name.clone()),
+            name: Some(name),
             model,
             assistant: None,
             source: None,
@@ -884,18 +892,28 @@ impl JobExecutor {
             return Ok(());
         }
 
-        agent
-            .set_mode(desired_mode)
-            .await
-            .map_err(|e| CronError::Scheduler(format!("set session mode to {desired_mode}: {e}")))?;
-
-        info!(
-            conversation_id = %agent.conversation_id(),
-            from_mode = %current_mode.mode,
-            to_mode = desired_mode,
-            initialized = current_mode.initialized,
-            "Applied cron session mode before execution"
-        );
+        match agent.set_mode(desired_mode).await {
+            Ok(()) => {
+                info!(
+                    conversation_id = %agent.conversation_id(),
+                    from_mode = %current_mode.mode,
+                    to_mode = desired_mode,
+                    initialized = current_mode.initialized,
+                    "Applied cron session mode before execution"
+                );
+            }
+            Err(e) if e.to_string().contains("not supported") => {
+                warn!(
+                    conversation_id = %agent.conversation_id(),
+                    desired_mode,
+                    error = %e,
+                    "Agent type does not support session mode switching, skipping"
+                );
+            }
+            Err(e) => {
+                return Err(CronError::Scheduler(format!("set session mode to {desired_mode}: {e}")));
+            }
+        }
 
         Ok(())
     }
@@ -954,7 +972,7 @@ async fn wait_for_terminal_event(mut rx: broadcast::Receiver<AgentStreamEvent>) 
 /// 3. Fallback to [`AgentType::Acp`] to preserve the prior default.
 async fn parse_agent_type(registry: &AgentRegistry, agent_type_str: &str) -> Result<AgentType, CronError> {
     if let Ok(agent_type) = serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type_str.to_owned())) {
-        if agent_type.is_deprecated_runtime() {
+        if !agent_type.supports_conversation_runtime() {
             return Err(CronError::InvalidAgentConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
         }
         return Ok(agent_type);
@@ -1065,6 +1083,13 @@ async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[Str
                     serde_json::Value::String(custom_agent_id.clone()),
                 );
             }
+            // Remote agent factory expects `remote_agent_id` in the extra.
+            if config.backend == "remote" {
+                extra.insert(
+                    "remote_agent_id".to_owned(),
+                    serde_json::Value::String(custom_agent_id.clone()),
+                );
+            }
         }
         if let Some(mode) = &config.mode {
             extra.insert("session_mode".to_owned(), serde_json::Value::String(mode.clone()));
@@ -1132,6 +1157,13 @@ async fn build_conversation_extra(
             if config.is_preset.unwrap_or(false) {
                 extra.insert(
                     "preset_assistant_id".to_owned(),
+                    serde_json::Value::String(custom_agent_id.clone()),
+                );
+            }
+            // Remote agent factory expects `remote_agent_id` in the extra.
+            if config.backend == "remote" {
+                extra.insert(
+                    "remote_agent_id".to_owned(),
                     serde_json::Value::String(custom_agent_id.clone()),
                 );
             }
@@ -1479,7 +1511,7 @@ mod tests {
     #[tokio::test]
     async fn parse_agent_type_rejects_deprecated_runtime_types() {
         let registry = hydrated_registry().await;
-        for agent_type in ["openclaw-gateway", "nanobot", "remote", "gemini", "codex"] {
+        for agent_type in ["nanobot", "gemini", "codex"] {
             let err = parse_agent_type(&registry, agent_type).await.unwrap_err();
             assert!(matches!(err, CronError::InvalidAgentConfig(_)));
             assert!(

@@ -8,7 +8,7 @@ use aionui_ai_agent::session_context::{
 };
 use aionui_ai_agent::shared_kernel::{ConfigKey, ConfigValue, ModeId, ModelId, PersistedSessionState};
 use aionui_ai_agent::types::BuildTaskOptions;
-use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra};
+use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, OpenClawBuildExtra};
 use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
 use aionui_db::models::ConversationRow;
 use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
@@ -156,11 +156,10 @@ impl<'a> SessionContextBuilder<'a> {
                 .await
                 .map(|context| AgentSessionKind::Acp(Box::new(context))),
             AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(row, extra)))),
-            AgentType::Gemini
-            | AgentType::Codex
-            | AgentType::OpenclawGateway
-            | AgentType::Remote
-            | AgentType::Nanobot => {
+            AgentType::OpenclawGateway | AgentType::Remote => {
+                Ok(AgentSessionKind::OpenclawGateway(Box::new(build_openclaw_context(row, extra))))
+            }
+            AgentType::Gemini | AgentType::Codex | AgentType::Nanobot => {
                 unreachable!("legacy agent types are rejected before build_kind")
             }
         }
@@ -316,12 +315,28 @@ fn build_aionrs_context(row: &ConversationRow, extra: serde_json::Value) -> Aion
     }
 }
 
+fn build_openclaw_context(row: &ConversationRow, extra: serde_json::Value) -> OpenClawBuildExtra {
+    let mut config: OpenClawBuildExtra = match serde_json::from_value(extra.clone()) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(
+                conversation_id = %row.id,
+                error = %err,
+                "session_context: invalid openclaw extra; using defaults"
+            );
+            OpenClawBuildExtra::default()
+        }
+    };
+    config.user_id.get_or_insert_with(|| row.user_id.clone());
+    config
+}
+
 fn parse_extra(row: &ConversationRow) -> Result<serde_json::Value, ConversationError> {
     serde_json::from_str(&row.extra).map_err(|e| ConversationError::internal(format!("Invalid extra JSON: {e}")))
 }
 
 fn reject_deprecated_runtime_kind(row: &ConversationRow, agent_type: &AgentType) -> Result<(), ConversationError> {
-    if !agent_type.is_deprecated_runtime() {
+    if agent_type.supports_conversation_runtime() {
         return Ok(());
     }
 
@@ -694,12 +709,7 @@ mod tests {
         for (agent_type, extra) in [
             ("gemini", serde_json::json!({})),
             ("codex", serde_json::json!({ "workspace": "/tmp/aionui-codex-history" })),
-            (
-                "openclaw-gateway",
-                serde_json::json!({ "gateway": { "use_external_gateway": true } }),
-            ),
             ("nanobot", serde_json::json!({})),
-            ("remote", serde_json::json!({})),
         ] {
             let row = row(agent_type, extra, None);
             let err = repos.builder().build(&row).await.unwrap_err();

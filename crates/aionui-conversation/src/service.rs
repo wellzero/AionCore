@@ -213,19 +213,20 @@ fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), Conversati
         return Ok(());
     };
 
-    if agent_type.is_deprecated_runtime() {
-        debug!(
-            conversation_id = %row.id,
-            agent_type = agent_type.serde_name(),
-            "Rejected deprecated runtime conversation"
-        );
-        return Err(ConversationError::Archived {
-            id: row.id.clone(),
-            reason: LEGACY_CONVERSATION_ARCHIVED_MESSAGE.into(),
-        });
+    if agent_type.supports_conversation_runtime() {
+        return Ok(());
     }
 
-    Ok(())
+    debug!(
+        conversation_id = %row.id,
+        agent_type = agent_type.serde_name(),
+        "Rejected deprecated runtime conversation"
+    );
+
+    Err(ConversationError::Archived {
+        id: row.id.clone(),
+        reason: LEGACY_CONVERSATION_ARCHIVED_MESSAGE.into(),
+    })
 }
 
 #[derive(Clone)]
@@ -481,7 +482,7 @@ impl ConversationService {
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
-        if !req.r#type.supports_new_conversation() {
+        if !req.r#type.supports_conversation_runtime() {
             info!(
                 agent_type = req.r#type.serde_name(),
                 source = ?source,
