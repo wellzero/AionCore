@@ -41,7 +41,7 @@ pub struct AuthConfig {
 pub struct OpenClawConnection {
     ws_sink: Mutex<Option<WsSink>>,
     pending: Mutex<HashMap<String, PendingSender>>,
-    event_tx: broadcast::Sender<EventFrame>,
+    event_tx: Mutex<Option<broadcast::Sender<EventFrame>>>,
     connected: AtomicBool,
     challenge_tx: Mutex<Option<oneshot::Sender<Option<String>>>>,
     _reader_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -67,7 +67,7 @@ impl OpenClawConnection {
         let conn = Arc::new(Self {
             ws_sink: Mutex::new(Some(sink)),
             pending: Mutex::new(HashMap::new()),
-            event_tx,
+            event_tx: Mutex::new(Some(event_tx)),
             connected: AtomicBool::new(false),
             challenge_tx: Mutex::new(Some(challenge_tx)),
             _reader_handle: Mutex::new(None),
@@ -195,8 +195,15 @@ impl OpenClawConnection {
             .map_err(|e| AgentError::Internal(format!("Failed to parse OpenClaw response for '{method}': {e}")))
     }
 
-    pub fn subscribe_events(&self) -> broadcast::Receiver<EventFrame> {
-        self.event_tx.subscribe()
+    pub async fn subscribe_events(&self) -> broadcast::Receiver<EventFrame> {
+        if let Some(tx) = self.event_tx.lock().await.as_ref() {
+            tx.subscribe()
+        } else {
+            // Connection is closed; return a receiver that is already closed.
+            let (tx, rx) = broadcast::channel(1);
+            drop(tx);
+            rx
+        }
     }
 
     pub fn is_connected(&self) -> bool {
@@ -205,6 +212,9 @@ impl OpenClawConnection {
 
     pub async fn close(&self) {
         self.connected.store(false, Ordering::Relaxed);
+
+        // Drop the event sender so any waiting relay sees the channel close.
+        let _ = self.event_tx.lock().await.take();
 
         if let Some(mut sink) = self.ws_sink.lock().await.take() {
             let _ = sink.close().await;
@@ -236,6 +246,9 @@ impl OpenClawConnection {
         }
 
         self.connected.store(false, Ordering::Relaxed);
+
+        // Drop the event sender so waiting relays observe channel close.
+        let _ = self.event_tx.lock().await.take();
 
         // Fail all pending requests
         let mut pending = self.pending.lock().await;
@@ -287,7 +300,9 @@ impl OpenClawConnection {
                     return;
                 }
 
-                let _ = self.event_tx.send(evt);
+                if let Some(tx) = self.event_tx.lock().await.as_ref() {
+                    let _ = tx.send(evt);
+                }
             }
         }
     }
@@ -488,7 +503,7 @@ mod tests {
             .await
             .unwrap()
             .0;
-        let mut event_rx = conn.subscribe_events();
+        let mut event_rx = conn.subscribe_events().await;
 
         let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
             .await
@@ -500,6 +515,29 @@ mod tests {
 
         conn.close().await;
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn close_drops_event_sender() {
+        let (url, _server) = spawn_mock_gateway(None).await;
+        let conn = OpenClawConnection::connect(&url, None, &generate_identity())
+            .await
+            .unwrap()
+            .0;
+        let mut event_rx = conn.subscribe_events().await;
+
+        conn.close().await;
+
+        assert!(
+            matches!(event_rx.recv().await, Err(broadcast::error::RecvError::Closed)),
+            "existing event receiver should close when connection closes"
+        );
+
+        let mut new_rx = conn.subscribe_events().await;
+        assert!(
+            matches!(new_rx.recv().await, Err(broadcast::error::RecvError::Closed)),
+            "new event receiver should also be closed after connection closes"
+        );
     }
 
     #[tokio::test]

@@ -199,7 +199,7 @@ impl OpenClawAgentManager {
     }
 
     async fn run_event_relay(self: Arc<Self>) {
-        let mut event_rx = self.connection.subscribe_events();
+        let mut event_rx = self.connection.subscribe_events().await;
 
         loop {
             match event_rx.recv().await {
@@ -235,9 +235,13 @@ impl OpenClawAgentManager {
             }
         }
 
-        // Channel closed without a terminal event; transition to Finished if still Running.
+        // Channel closed without a terminal event; finalize the turn if still running.
         if self.runtime.status() == Some(ConversationStatus::Running) {
-            self.runtime.transition_to(ConversationStatus::Finished);
+            warn!(
+                conversation_id = %self.runtime.conversation_id(),
+                "OpenClaw event channel closed mid-turn; emitting fallback Finish"
+            );
+            self.runtime.emit_finish(None);
         }
     }
 
