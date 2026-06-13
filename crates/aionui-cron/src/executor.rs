@@ -1100,6 +1100,14 @@ async fn build_task_extra(registry: &AgentRegistry, job: &CronJob, skills: &[Str
 }
 
 fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> String {
+    // Remote/OpenClaw agents are external gateways: they forward the user
+    // message verbatim to a remote process. The scheduled-task wrapper used
+    // for LLM-style agents changes what the remote process sees, so cron
+    // output diverges from a manual chat click. Send the raw message instead.
+    if is_remote_like_job(job) {
+        return job.message.trim().to_owned();
+    }
+
     let schedule_desc = schedule_description_text(&job.schedule);
 
     match job.execution_mode {
@@ -1112,6 +1120,21 @@ fn build_prompt(job: &CronJob, saved_skill: Option<&SavedSkillContext>) -> Strin
             }
         }
     }
+}
+
+fn is_remote_like_job(job: &CronJob) -> bool {
+    let agent_type = job.agent_type.trim().to_lowercase();
+    if agent_type == "remote" || agent_type == "openclaw-gateway" {
+        return true;
+    }
+
+    if let Some(config) = &job.agent_config {
+        if config.backend.trim().eq_ignore_ascii_case("remote") {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1484,6 +1507,46 @@ mod tests {
         };
         let prompt = build_prompt(&job, None);
         assert!(prompt.contains("SKILL_SUGGEST.md"));
+    }
+
+    #[test]
+    fn build_prompt_remote_agent_existing_mode_uses_raw_message() {
+        let job = CronJob {
+            agent_type: "remote".into(),
+            execution_mode: ExecutionMode::Existing,
+            ..sample_job()
+        };
+        let prompt = build_prompt(&job, None);
+        assert_eq!(prompt, "do something");
+        assert!(!prompt.contains("[Scheduled Task Execution]"));
+    }
+
+    #[test]
+    fn build_prompt_openclaw_gateway_new_conv_uses_raw_message() {
+        let job = CronJob {
+            agent_type: "openclaw-gateway".into(),
+            execution_mode: ExecutionMode::NewConversation,
+            ..sample_job()
+        };
+        let prompt = build_prompt(&job, None);
+        assert_eq!(prompt, "do something");
+        assert!(!prompt.contains("[Scheduled Task Context]"));
+        assert!(!prompt.contains("SKILL_SUGGEST.md"));
+    }
+
+    #[test]
+    fn build_prompt_acp_with_remote_backend_uses_raw_message() {
+        let job = CronJob {
+            agent_type: "acp".into(),
+            agent_config: Some(CronAgentConfig {
+                backend: "remote".into(),
+                ..sample_job().agent_config.unwrap()
+            }),
+            ..sample_job()
+        };
+        let prompt = build_prompt(&job, None);
+        assert_eq!(prompt, "do something");
+        assert!(!prompt.contains("[Scheduled Task Execution]"));
     }
 
     // -- registry helper ------------------------------------------------------
