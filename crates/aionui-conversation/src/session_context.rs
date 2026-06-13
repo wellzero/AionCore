@@ -11,7 +11,7 @@ use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, OpenClawBuildExtra};
 use aionui_common::{AgentType, WorkspacePathValidationError, validate_workspace_path_availability};
 use aionui_db::models::ConversationRow;
-use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository};
+use aionui_db::{IAcpSessionRepository, IAgentMetadataRepository, IRemoteAgentRepository};
 use tracing::{debug, warn};
 
 use crate::convert::string_to_enum;
@@ -25,6 +25,7 @@ pub(crate) struct SessionContextBuilder<'a> {
     workspace_root: &'a Path,
     agent_metadata_repo: &'a Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: &'a Arc<dyn IAcpSessionRepository>,
+    remote_agent_repo: Option<Arc<dyn IRemoteAgentRepository>>,
 }
 
 impl<'a> SessionContextBuilder<'a> {
@@ -37,7 +38,13 @@ impl<'a> SessionContextBuilder<'a> {
             workspace_root,
             agent_metadata_repo,
             acp_session_repo,
+            remote_agent_repo: None,
         }
+    }
+
+    pub(crate) fn with_remote_agent_repo(mut self, repo: Arc<dyn IRemoteAgentRepository>) -> Self {
+        self.remote_agent_repo = Some(repo);
+        self
     }
 
     pub(crate) async fn build_options(&self, row: &ConversationRow) -> Result<BuildTaskOptions, ConversationError> {
@@ -151,10 +158,14 @@ impl<'a> SessionContextBuilder<'a> {
         extra: serde_json::Value,
     ) -> Result<AgentSessionKind, ConversationError> {
         match agent_type {
-            AgentType::Acp => self
-                .build_acp_context(row, extra)
-                .await
-                .map(|context| AgentSessionKind::Acp(Box::new(context))),
+            AgentType::Acp => {
+                if let Some(config) = self.maybe_resolve_remote_agent_config(row, &extra).await? {
+                    return Ok(AgentSessionKind::OpenclawGateway(Box::new(config)));
+                }
+                self.build_acp_context(row, extra)
+                    .await
+                    .map(|context| AgentSessionKind::Acp(Box::new(context)))
+            }
             AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(row, extra)))),
             AgentType::OpenclawGateway | AgentType::Remote => {
                 Ok(AgentSessionKind::OpenclawGateway(Box::new(build_openclaw_context(row, extra))))
@@ -163,6 +174,59 @@ impl<'a> SessionContextBuilder<'a> {
                 unreachable!("legacy agent types are rejected before build_kind")
             }
         }
+    }
+
+    /// ACP conversations created from a remote agent carry the remote agent id
+    /// in `extra.agent_id` / `extra.custom_agent_id` / `extra.backend`. Route
+    /// those through the OpenClaw gateway runtime instead of the normal ACP
+    /// factory, which only knows about catalog-resolved agents.
+    async fn maybe_resolve_remote_agent_config(
+        &self,
+        row: &ConversationRow,
+        extra: &serde_json::Value,
+    ) -> Result<Option<OpenClawBuildExtra>, ConversationError> {
+        let repo = match self.remote_agent_repo.as_ref() {
+            Some(repo) => repo,
+            None => return Ok(None),
+        };
+
+        let candidates: Vec<String> = [
+            extra.get("agent_id").and_then(serde_json::Value::as_str),
+            extra.get("custom_agent_id").and_then(serde_json::Value::as_str),
+            extra.get("backend").and_then(serde_json::Value::as_str),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .filter(|value| value.starts_with("ra_"))
+        .map(String::from)
+        .collect();
+
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        for remote_agent_id in candidates {
+            match repo.find_by_id(&remote_agent_id).await {
+                Ok(Some(_)) => {
+                    let mut config: OpenClawBuildExtra =
+                        serde_json::from_value(extra.clone()).map_err(|e| ConversationError::BadRequest {
+                            reason: format!("Invalid remote build options: {e}"),
+                        })?;
+                    config.remote_agent_id = Some(remote_agent_id);
+                    config.user_id.get_or_insert_with(|| row.user_id.clone());
+                    return Ok(Some(config));
+                }
+                Ok(None) => continue,
+                Err(e) => {
+                    return Err(ConversationError::internal(format!(
+                        "Failed to load remote agent config: {e}"
+                    )));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     async fn build_acp_context(
