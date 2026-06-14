@@ -367,6 +367,9 @@ pub fn build_conversation_state(
     conversation_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
     )));
+    conversation_service.with_remote_agent_repo(Arc::new(aionui_db::SqliteRemoteAgentRepository::new(
+        services.database.pool().clone(),
+    )));
     conversation_service
         .with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(pool.clone())));
     conversation_service.with_assistant_state_repo(Arc::new(SqliteAssistantOverlayRepository::new(pool.clone())));

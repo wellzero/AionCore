@@ -1,4 +1,4 @@
-use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra};
+use aionui_api_types::{AcpBuildExtra, AionrsBuildExtra, OpenClawBuildExtra};
 use aionui_common::{AgentType, ProviderWithModel};
 
 use crate::shared_kernel::PersistedSessionState;
@@ -40,6 +40,7 @@ pub struct WorkspaceContext {
 pub enum AgentSessionKind {
     Acp(Box<AcpSessionBuildContext>),
     Aionrs(Box<AionrsSessionBuildContext>),
+    OpenclawGateway(Box<OpenClawBuildExtra>),
 }
 
 #[derive(Debug, Clone)]

@@ -19,6 +19,7 @@ use tokio::sync::broadcast;
 use crate::error::AgentError;
 use crate::manager::acp::AcpAgentManager;
 use crate::manager::aionrs::AionrsAgentManager;
+use crate::manager::openclaw::OpenClawAgentManager;
 use crate::protocol::events::AgentStreamEvent;
 use crate::protocol::send_error::AgentSendError;
 use crate::types::SendMessageData;
@@ -151,6 +152,7 @@ pub trait IMockAgent: IAgentTask {
 pub enum AgentInstance {
     Acp(Arc<AcpAgentManager>),
     Aionrs(Arc<AionrsAgentManager>),
+    OpenClaw(Arc<OpenClawAgentManager>),
     /// Test-only trait-object escape hatch used by downstream crates
     /// (conversation/cron/team/app tests) to inject fake agents without
     /// spinning up a real CLI or WebSocket connection. Gated behind
@@ -170,6 +172,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.as_ref(),
             Self::Aionrs(m) => m.as_ref(),
+            Self::OpenClaw(m) => m.as_ref(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.as_ref(),
         }
@@ -235,6 +238,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.kill_and_wait(reason),
             Self::Aionrs(m) => m.kill_and_wait(reason),
+            Self::OpenClaw(m) => m.kill_and_wait(reason),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(_) => Box::pin(std::future::ready(())),
         }
@@ -255,6 +259,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.get_confirmations(),
             Self::Aionrs(m) => m.get_confirmations(),
+            Self::OpenClaw(_) => Vec::new(),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_confirmations(),
         }
@@ -271,6 +276,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.confirm(msg_id, call_id, data, always_allow),
             Self::Aionrs(m) => m.confirm(msg_id, call_id, data, always_allow),
+            Self::OpenClaw(_) => Ok(()),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.confirm(msg_id, call_id, data, always_allow),
         }
@@ -281,6 +287,7 @@ impl AgentInstance {
         match self {
             Self::Acp(_) => false,
             Self::Aionrs(m) => m.check_approval(action, command_type),
+            Self::OpenClaw(_) => false,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.check_approval(action, command_type),
         }
@@ -289,7 +296,7 @@ impl AgentInstance {
     /// Session key for test doubles that expose one.
     pub fn get_session_key(&self) -> Option<String> {
         match self {
-            Self::Acp(_) | Self::Aionrs(_) => None,
+            Self::Acp(_) | Self::Aionrs(_) | Self::OpenClaw(_) => None,
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_session_key(),
         }
@@ -300,6 +307,10 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.mode().await,
             Self::Aionrs(m) => m.mode().await,
+            Self::OpenClaw(_) => Ok(aionui_api_types::AgentModeResponse {
+                mode: String::new(),
+                initialized: false,
+            }),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.mode().await,
         }
@@ -308,12 +319,15 @@ impl AgentInstance {
     /// Set the session mode. Unsupported for variants other than ACP /
     /// Aionrs — returns a `BadRequest` so the caller can surface an
     /// actionable error rather than silently no-op.
-    pub async fn set_mode(&self, mode: &str) -> Result<(), AgentError> {
+    pub async fn set_mode(&self, _mode: &str) -> Result<(), AgentError> {
         match self {
-            Self::Acp(m) => m.set_mode(mode).await,
-            Self::Aionrs(m) => m.set_mode(mode).await,
+            Self::Acp(m) => m.set_mode(_mode).await,
+            Self::Aionrs(m) => m.set_mode(_mode).await,
+            Self::OpenClaw(_) => Err(AgentError::bad_request(
+                "Mode switching is not supported for OpenClaw agents",
+            )),
             #[cfg(any(test, feature = "test-support"))]
-            Self::Mock(m) => m.set_mode(mode).await,
+            Self::Mock(m) => m.set_mode(_mode).await,
         }
     }
 
@@ -333,7 +347,7 @@ impl AgentInstance {
                 let model_info = merge_model_info(sdk_info, cc_switch_info);
                 Ok(GetModelInfoResponse { model_info })
             }
-            Self::Aionrs(_) => Ok(GetModelInfoResponse { model_info: None }),
+            Self::Aionrs(_) | Self::OpenClaw(_) => Ok(GetModelInfoResponse { model_info: None }),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_model().await,
         }
@@ -348,7 +362,7 @@ impl AgentInstance {
         }
         match self {
             Self::Acp(m) => m.set_model(model_id).await,
-            Self::Aionrs(_) => Err(AgentError::bad_request(
+            Self::Aionrs(_) | Self::OpenClaw(_) => Err(AgentError::bad_request(
                 "Model switching is not supported for this agent type",
             )),
             #[cfg(any(test, feature = "test-support"))]
@@ -367,7 +381,7 @@ impl AgentInstance {
             Self::Acp(m) => Ok(GetModelInfoResponse {
                 model_info: Some(map_sdk_model_to_payload(m.set_model_confirmed(model_id).await?)),
             }),
-            Self::Aionrs(_) => Err(AgentError::bad_request(
+            Self::Aionrs(_) | Self::OpenClaw(_) => Err(AgentError::bad_request(
                 "Model switching is not supported for this agent type",
             )),
             #[cfg(any(test, feature = "test-support"))]
@@ -392,7 +406,7 @@ impl AgentInstance {
                 aionui_common::normalize_keys_to_snake_case(&mut value);
                 Ok(Some(value))
             }
-            Self::Aionrs(_) => Ok(None),
+            Self::Aionrs(_) | Self::OpenClaw(_) => Ok(None),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_usage().await,
         }
@@ -405,6 +419,7 @@ impl AgentInstance {
         match self {
             Self::Acp(m) => m.load_slash_commands().await,
             Self::Aionrs(m) => m.get_slash_commands().await,
+            Self::OpenClaw(_) => Ok(Vec::new()),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.get_slash_commands().await,
         }
@@ -431,7 +446,7 @@ impl AgentInstance {
                     answer: Some("Side question support will be fully wired in app integration phase.".into()),
                 })
             }
-            Self::Aionrs(_) => Ok(SideQuestionResponse {
+            Self::Aionrs(_) | Self::OpenClaw(_) => Ok(SideQuestionResponse {
                 status: "unsupported".into(),
                 answer: None,
             }),
