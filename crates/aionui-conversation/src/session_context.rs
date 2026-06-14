@@ -167,9 +167,9 @@ impl<'a> SessionContextBuilder<'a> {
                     .map(|context| AgentSessionKind::Acp(Box::new(context)))
             }
             AgentType::Aionrs => Ok(AgentSessionKind::Aionrs(Box::new(build_aionrs_context(row, extra)))),
-            AgentType::OpenclawGateway | AgentType::Remote => {
-                Ok(AgentSessionKind::OpenclawGateway(Box::new(build_openclaw_context(row, extra))))
-            }
+            AgentType::OpenclawGateway | AgentType::Remote => Ok(AgentSessionKind::OpenclawGateway(Box::new(
+                build_openclaw_context(row, extra),
+            ))),
             AgentType::Gemini | AgentType::Codex | AgentType::Nanobot => {
                 unreachable!("legacy agent types are rejected before build_kind")
             }
@@ -198,7 +198,6 @@ impl<'a> SessionContextBuilder<'a> {
         .into_iter()
         .flatten()
         .filter(|value| !value.is_empty())
-        .filter(|value| value.starts_with("ra_"))
         .map(String::from)
         .collect();
 
