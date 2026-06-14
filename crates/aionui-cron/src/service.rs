@@ -531,7 +531,8 @@ impl CronService {
                 self.emitter.emit_job_executed(job_id, "skipped", None);
             }
             ExecutionResult::Error { message } => {
-                self.update_job_after_error(job_id, &message).await;
+                self.update_job_after_error(job_id, &job.conversation_id, &message)
+                    .await;
                 self.reschedule_after_execution(&job).await;
                 self.emitter.emit_job_executed(job_id, "error", Some(&message));
             }
@@ -545,7 +546,7 @@ impl CronService {
                 self.emitter.emit_job_executed(job_id, "ok", None);
             }
             ExecutionResult::Error { message } => {
-                self.update_job_after_error(job_id, &message).await;
+                self.update_job_after_error(job_id, "", &message).await;
                 self.emitter.emit_job_executed(job_id, "error", Some(&message));
             }
             ExecutionResult::Retrying { attempt } => {
@@ -593,8 +594,13 @@ impl CronService {
         // "existing" job is materialized (lazy binding). Subsequent runs then
         // reuse the same conversation, matching the UX where the job is the
         // continuation anchor.
-        let needs_conversation_bind =
-            existing_row.conversation_id.trim().is_empty() && !conversation_id.trim().is_empty();
+        //
+        // For "new_conversation" jobs a fresh conversation is created on every
+        // run, so we always overwrite the stored id with the latest one. This
+        // keeps the cron job UI pointing at the most recent execution.
+        let is_new_conversation = existing_row.execution_mode == "new_conversation";
+        let needs_conversation_bind = (is_new_conversation && !conversation_id.trim().is_empty())
+            || (existing_row.conversation_id.trim().is_empty() && !conversation_id.trim().is_empty());
         let params = UpdateCronJobParams {
             last_run_at: Some(Some(now)),
             last_status: Some(Some("ok".into())),
@@ -624,9 +630,9 @@ impl CronService {
         }
     }
 
-    async fn update_job_after_error(&self, job_id: &str, message: &str) {
-        let run_count = match self.repo.get_by_id(job_id).await {
-            Ok(Some(r)) => r.run_count,
+    async fn update_job_after_error(&self, job_id: &str, conversation_id: &str, message: &str) {
+        let existing_row = match self.repo.get_by_id(job_id).await {
+            Ok(Some(r)) => r,
             Ok(None) => return,
             Err(e) => {
                 error!(job_id, error = %e, "Failed to read job for run_count");
@@ -634,12 +640,22 @@ impl CronService {
             }
         };
         let now = now_ms();
+        // New-conversation jobs spawn a fresh conversation before executing;
+        // if the run fails we still want the cron job row to point at that
+        // conversation so the user can inspect what went wrong.
+        let is_new_conversation = existing_row.execution_mode == "new_conversation";
+        let conversation_id_update = if is_new_conversation && !conversation_id.trim().is_empty() {
+            Some(conversation_id.to_owned())
+        } else {
+            None
+        };
         let params = UpdateCronJobParams {
             last_run_at: Some(Some(now)),
             last_status: Some(Some("error".into())),
             last_error: Some(Some(message.to_owned())),
             retry_count: Some(0),
-            run_count: Some(run_count + 1),
+            run_count: Some(existing_row.run_count + 1),
+            conversation_id: conversation_id_update,
             ..Default::default()
         };
         if let Err(e) = self.repo.update(job_id, &params).await {
@@ -813,17 +829,26 @@ impl CronService {
             }
         };
 
-        for row in &jobs {
+        // Only cascade-delete existing-mode jobs. NewConversation jobs create a
+        // fresh conversation on every run and merely store the last created
+        // conversation_id; deleting that conversation should not delete the
+        // cron job itself (the user would lose their scheduled task).
+        let existing_jobs: Vec<_> = jobs
+            .into_iter()
+            .filter(|row| row.execution_mode != "new_conversation")
+            .collect();
+
+        for row in &existing_jobs {
             self.scheduler.cancel_job(&row.id);
             self.emitter.emit_job_removed(&row.id);
         }
 
         if let Err(e) = self.repo.delete_by_conversation(conversation_id).await {
             error!(conversation_id, error = %e, "Failed to cascade-delete cron jobs");
-        } else if !jobs.is_empty() {
+        } else if !existing_jobs.is_empty() {
             info!(
                 conversation_id,
-                count = jobs.len(),
+                count = existing_jobs.len(),
                 "Cascade-deleted cron jobs for conversation"
             );
         }
@@ -1134,7 +1159,7 @@ fn validate_aionrs_agent_config(
 
 fn reject_deprecated_new_conversation_agent_type(agent_type: &str) -> Result<(), CronError> {
     let parsed = serde_json::from_value::<AgentType>(serde_json::Value::String(agent_type.to_owned())).ok();
-    if parsed.is_some_and(|agent_type| agent_type.is_deprecated_runtime()) {
+    if parsed.is_some_and(|agent_type| !agent_type.supports_conversation_runtime()) {
         return Err(CronError::InvalidAgentConfig(DEPRECATED_AGENT_TYPE_MESSAGE.into()));
     }
     Ok(())

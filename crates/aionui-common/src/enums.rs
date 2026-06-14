@@ -55,6 +55,13 @@ impl AgentType {
         matches!(self, AgentType::Acp | AgentType::Aionrs)
     }
 
+    pub fn supports_conversation_runtime(&self) -> bool {
+        matches!(
+            self,
+            AgentType::Acp | AgentType::Aionrs | AgentType::OpenclawGateway | AgentType::Remote
+        )
+    }
+
     pub fn is_deprecated_runtime(&self) -> bool {
         !self.supports_new_conversation()
     }

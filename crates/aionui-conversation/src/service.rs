@@ -28,8 +28,8 @@ use aionui_db::models::{ConversationRow, MessageRow};
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, SaveRuntimeStateParams, SortOrder,
-    UpsertConversationAssistantSnapshotParams,
+    IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IRemoteAgentRepository,
+    SaveRuntimeStateParams, SortOrder, UpsertConversationAssistantSnapshotParams,
 };
 use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
@@ -215,19 +215,20 @@ fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), Conversati
         return Ok(());
     };
 
-    if agent_type.is_deprecated_runtime() {
-        debug!(
-            conversation_id = %row.id,
-            agent_type = agent_type.serde_name(),
-            "Rejected deprecated runtime conversation"
-        );
-        return Err(ConversationError::Archived {
-            id: row.id.clone(),
-            reason: LEGACY_CONVERSATION_ARCHIVED_MESSAGE.into(),
-        });
+    if agent_type.supports_conversation_runtime() {
+        return Ok(());
     }
 
-    Ok(())
+    debug!(
+        conversation_id = %row.id,
+        agent_type = agent_type.serde_name(),
+        "Rejected deprecated runtime conversation"
+    );
+
+    Err(ConversationError::Archived {
+        id: row.id.clone(),
+        reason: LEGACY_CONVERSATION_ARCHIVED_MESSAGE.into(),
+    })
 }
 
 #[derive(Clone)]
@@ -254,6 +255,7 @@ pub struct ConversationService {
     conversation_repo: Arc<dyn IConversationRepository>,
     agent_metadata_repo: Arc<dyn IAgentMetadataRepository>,
     acp_session_repo: Arc<dyn IAcpSessionRepository>,
+    remote_agent_repo: Arc<RwLock<Option<Arc<dyn IRemoteAgentRepository>>>>,
 }
 
 #[derive(Clone)]
@@ -319,6 +321,7 @@ impl ConversationService {
             conversation_repo,
             agent_metadata_repo,
             acp_session_repo,
+            remote_agent_repo: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -335,6 +338,12 @@ impl ConversationService {
 
     pub fn with_mcp_server_repo(&self, repo: Arc<dyn IMcpServerRepository>) {
         if let Ok(mut guard) = self.mcp_server_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    pub fn with_remote_agent_repo(&self, repo: Arc<dyn IRemoteAgentRepository>) {
+        if let Ok(mut guard) = self.remote_agent_repo.write() {
             *guard = Some(repo);
         }
     }
@@ -516,7 +525,7 @@ impl ConversationService {
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
-        if !req.r#type.supports_new_conversation() {
+        if !req.r#type.supports_conversation_runtime() {
             info!(
                 agent_type = req.r#type.serde_name(),
                 source = ?source,
@@ -2564,9 +2573,14 @@ impl ConversationService {
         row: &aionui_db::models::ConversationRow,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
-            .build_options(row)
-            .await
+        let mut builder =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo);
+        if let Ok(guard) = self.remote_agent_repo.read() {
+            if let Some(repo) = guard.as_ref() {
+                builder = builder.with_remote_agent_repo(Arc::clone(repo));
+            }
+        }
+        builder.build_options(row).await
     }
 
     pub async fn build_task_options_for_runtime(
@@ -2575,7 +2589,14 @@ impl ConversationService {
         workspace_override: Option<&str>,
     ) -> Result<BuildTaskOptions, ConversationError> {
         reject_deprecated_runtime_row(row)?;
-        SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo)
+        let mut builder =
+            SessionContextBuilder::new(&self.workspace_root, &self.agent_metadata_repo, &self.acp_session_repo);
+        if let Ok(guard) = self.remote_agent_repo.read() {
+            if let Some(repo) = guard.as_ref() {
+                builder = builder.with_remote_agent_repo(Arc::clone(repo));
+            }
+        }
+        builder
             .build_options_with_workspace_override(row, workspace_override)
             .await
     }
